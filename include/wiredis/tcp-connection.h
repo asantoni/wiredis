@@ -35,9 +35,12 @@ namespace nokia
             uint64_t const SEND_BUFFER_LIMIT = 10485760; // 10 Megabyte. todo [w] Do we need so much?
                 
             template <typename... Ts>
-            tcp_connection(boost::asio::io_service & io_service, Ts &&... parser_args):
-                _io_service(io_service),
-                _socket(_io_service),
+            tcp_connection(boost::asio::io_service & io_service,
+                           boost::asio::io_context::strand& strand,
+                           Ts &&... parser_args):
+                _io_context(io_service),
+                _strand(strand),
+                _socket(_io_context),
                 _astate(astate::DISCONNECTED),
                 _ostate(ostate::DISCONNECTED),
                 _ip(""),
@@ -46,7 +49,7 @@ namespace nokia
                 _tcp_keepalive_enabled(true),
                 _reconnect_wait(2),
                 _parser(std::forward<Ts>(parser_args)...),
-                _timer(_io_service),
+                _timer(_io_context),
                 _send_buffer_size{0}
             {
             }
@@ -93,7 +96,7 @@ namespace nokia
             void disconnect()
             {
                 // Called by user
-                _io_service.dispatch([this] ()
+                _io_context.dispatch([this] ()
                                      {
                                          _connected_callback = nullptr;
                                          _disconnected_callback = nullptr;
@@ -107,7 +110,7 @@ namespace nokia
 
             void join(std::function<void ()> cb)
             {
-                _io_service.dispatch([this, cb] ()
+                _io_context.dispatch([this, cb] ()
                                      {
                                          if (astate::DISCONNECTED == _astate && ostate::DISCONNECTED == _ostate)
                                          {
@@ -149,7 +152,7 @@ namespace nokia
             
             void reconnect()
             {
-                _io_service.dispatch([this] ()
+                _io_context.dispatch([this] ()
                                      {
                                          disconnect(false); // Preserve CONNECTED administration state
                                          if (!_auto_reconnect)
@@ -203,7 +206,7 @@ namespace nokia
 
                 if (send_now)
                 {
-                    _io_service.dispatch([this] ()
+                    _strand.dispatch([this] ()
                                          {
                                              try_to_send();
                                          });
@@ -240,6 +243,7 @@ namespace nokia
                     
                 boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(ip), port);
                 _socket.async_connect(endpoint,
+                                      boost::asio::bind_executor(_strand,
                                       [this] (boost::system::error_code const & error)
                                       {
                                           if (error)
@@ -266,7 +270,7 @@ namespace nokia
                                                   _connected_callback(error);
                                               }
                                           }
-                                      });
+                                      }));
             }
 
 
@@ -286,6 +290,7 @@ namespace nokia
                 std::size_t message_length = first_message.size() - start_byte;
 
                 _socket.async_write_some(boost::asio::buffer(&first_message[start_byte], message_length),
+                                         boost::asio::bind_executor(_strand,
                                          [this, start_byte, message_length] (boost::system::error_code const & error,
                                                                              std::size_t bytes_transferred)
                                          {
@@ -324,7 +329,7 @@ namespace nokia
                                                  try_to_send();
                                              }
                                              return;
-                                         });
+                                         }));
             }
             
             
@@ -370,7 +375,8 @@ namespace nokia
                 {
                     ::nokia::net::proto::char_buffer const & buffer = _parser.on_read(bytes_transferred, _read_callback);
                     _socket.async_read_some(boost::asio::buffer(buffer.ptr, buffer.size),
-                                            std::bind(&tcp_connection::on_read, this, std::placeholders::_1, std::placeholders::_2));
+                                            boost::asio::bind_executor(_strand,
+                                            std::bind(&tcp_connection::on_read, this, std::placeholders::_1, std::placeholders::_2)));
                 }
                 catch (parse_error const &)
                 {
@@ -401,6 +407,7 @@ namespace nokia
                  *       See: https://lore.kernel.org/patchwork/patch/960970/
                  */
 
+#ifdef __linux__
                 auto native_socket = _socket.native_handle();
                 int optval{2};
                 socklen_t optlen = sizeof(optval);
@@ -425,14 +432,15 @@ namespace nokia
                     optval = 6000;
                     setsockopt(native_socket, SOL_TCP, TCP_USER_TIMEOUT, &optval, optlen);
                 }
-                
+#endif
             }
-            
+
             
         private:
 
 
-            boost::asio::io_service & _io_service;
+            boost::asio::io_context & _io_context;
+            boost::asio::io_context::strand& _strand;
             boost::asio::ip::tcp::socket _socket;
             astate _astate;
             ostate _ostate;

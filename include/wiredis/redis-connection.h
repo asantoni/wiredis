@@ -46,10 +46,11 @@ namespace nokia
             };
             
             
-            redis_connection(boost::asio::io_service & io_service):
+            redis_connection(boost::asio::io_context & io_context,
+                             boost::asio::io_context::strand & strand):
                 ERROR_TCP_DISCONNECTED{"TCP DISCONNECTED"},
                 ERROR_TCP_CANNOT_SEND_MESSAGE{"TCP CANNOT SEND MESSAGE"},
-                _tcp(io_service, 10240),
+                _tcp(io_context, strand, 10240),
                 _pubsub_mode(false)
             {
             }
@@ -132,9 +133,10 @@ namespace nokia
                 
                 std::string message = "*" + std::to_string(sizeof...(ts)) + "\r\n";
                 append_bulk_string(message, ts...);
-                // std::cout << "message to be sent: " << message << std::endl;
+                //std::cout << "message to be sent: " << message << std::endl;
                 if (nullptr != callback)
                 {
+                    std::unique_lock<std::mutex> locker(m_mutex);
                     // unsubscribe commands are handled different
                     _op_callbacks.emplace_back(callback);
                 }
@@ -146,6 +148,7 @@ namespace nokia
                 {
                     if (nullptr != callback)
                     {
+                        std::unique_lock<std::mutex> locker(m_mutex);
                         ::nokia::net::proto::redis::reply error_reply;
                         error_reply.type = ::nokia::net::proto::redis::reply::ERROR;
                         error_reply.str = ex.what();
@@ -157,7 +160,60 @@ namespace nokia
                 }
             }
 
-            
+            //ALBERT:
+            template <typename... Ts>
+            std::string prepare_msg(Ts &&... ts)
+            {
+                std::string message = "*" + std::to_string(sizeof...(ts)) + "\r\n";
+                append_bulk_string(message, ts...);
+                return message;
+            }
+
+            template <typename... Msgs>
+            void execute_prepared(std::function<void (::nokia::net::proto::redis::reply &&)> callback, Msgs &&... msgs)
+            {
+                if (!_tcp.connected())
+                {
+                    ::nokia::net::proto::redis::reply error_reply;
+                    error_reply.type = ::nokia::net::proto::redis::reply::ERROR;
+                    error_reply.str = ERROR_TCP_CANNOT_SEND_MESSAGE;
+                    callback(std::move(error_reply));
+                    return;
+                }
+
+                //Build outer array
+                std::string message; //"*" + std::to_string(sizeof...(msgs)) + "\r\n";
+                append_bulk_msg(message, msgs...);
+
+                //std::cout << "message to be sent: " << message << std::endl;
+                if (nullptr != callback)
+                {
+                    std::unique_lock<std::mutex> locker(m_mutex);
+                    for (int idx = 0; idx < sizeof...(msgs); idx++) {
+                        // unsubscribe commands are handled different
+                        _op_callbacks.emplace_back(callback);
+                    }
+                }
+                try
+                {
+                    _tcp.send(std::move(message));
+                }
+                catch (std::exception const & ex)
+                {
+                    if (nullptr != callback)
+                    {
+                        std::unique_lock<std::mutex> locker(m_mutex);
+                        ::nokia::net::proto::redis::reply error_reply;
+                        error_reply.type = ::nokia::net::proto::redis::reply::ERROR;
+                        error_reply.str = ex.what();
+                        auto & op_callback = _op_callbacks.back();
+                        op_callback(std::move(error_reply));
+                        _op_callbacks.pop_back();
+                    }
+                }
+            }
+
+
 
             void subscribe(std::string const & channel,
                            std::function<void ()> subscribed_callback,
@@ -258,6 +314,7 @@ namespace nokia
 
             void notify_all_pending_requests(std::string const & error_message)
             {
+                std::unique_lock<std::mutex> locker(m_mutex);
                 while (!_op_callbacks.empty())
                 {
                     ::nokia::net::proto::redis::reply error_reply;
@@ -277,6 +334,8 @@ namespace nokia
                 {
                     return;
                 }
+
+                std::unique_lock<std::mutex> locker(m_mutex);
                 // Regular callbacks
                 if (_op_callbacks.empty())
                 {
@@ -304,6 +363,22 @@ namespace nokia
                 append_bulk_string(target, ts...);
             }
 
+
+            //ALBERT
+            void append_bulk_msg(std::string & target, std::string const & t)
+            {
+//                target += "$" + std::to_string(t.size()) + "\r\n" + t + "\r\n";
+                target += t;// + "\r\n";
+            }
+
+            //ALBERT
+            template <typename... Ts>
+            void append_bulk_msg(std::string & target, std::string const & t, Ts &&... ts)
+            {
+                target += t; // + "\r\n";
+                //target += "$" + std::to_string(t.size()) + "\r\n" + t + "\r\n";
+                append_bulk_msg(target, ts...);
+            }
 
             bool check_subscribe_callback(::nokia::net::proto::redis::reply & reply)
             {
@@ -500,6 +575,7 @@ namespace nokia
             std::function<void (boost::system::error_code const &)> _disconnected_callback;
             std::function<void (std::string const &)> _log_callback;
             
+            std::mutex m_mutex; //Protects _op_callbacks, which may be accessed by different threads.
             std::deque<std::function<void (::nokia::net::proto::redis::reply &&)>> _op_callbacks;
 
             bool _pubsub_mode;
